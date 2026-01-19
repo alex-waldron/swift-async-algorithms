@@ -28,6 +28,12 @@ let availabilityMacros: [SwiftSetting] = [
 
 let package = Package(
   name: "swift-async-algorithms",
+  platforms: [
+      .iOS(.v26),
+      .macOS(.v26),
+      .tvOS(.v26),
+      .watchOS(.v26),
+  ],
   products: [
     .library(name: "AsyncAlgorithms", targets: ["AsyncAlgorithms"])
   ],
