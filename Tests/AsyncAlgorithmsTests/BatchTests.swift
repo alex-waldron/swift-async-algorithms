@@ -262,6 +262,76 @@ struct BatcherTests {
     }
   }
 
+  @Suite("Max batch size")
+  struct MaxBatchSize {
+
+    @available(AsyncAlgorithms 1.2, *)
+    @Test func limitsElementsPerIteration() async {
+      let batcher = Batcher(initialValues: [1, 2, 3, 4, 5], maxBatchSize: 2)
+      batcher.finish()
+
+      let batches = await Array(batcher)
+      #expect(batches == [[1, 2], [3, 4], [5]])
+    }
+
+    @available(AsyncAlgorithms 1.2, *)
+    @Test func returnsAllWhenBufferSmallerThanMaxSize() async {
+      let batcher = Batcher(initialValues: [1, 2], maxBatchSize: 10)
+      batcher.finish()
+
+      let batches = await Array(batcher)
+      #expect(batches == [[1, 2]])
+    }
+
+    @available(AsyncAlgorithms 1.2, *)
+    @Test func maxBatchSizeOfOne() async {
+      let batcher = Batcher(initialValues: [1, 2, 3], maxBatchSize: 1)
+      batcher.finish()
+
+      let batches = await Array(batcher)
+      #expect(batches == [[1], [2], [3]])
+    }
+
+    @available(AsyncAlgorithms 1.2, *)
+    @Test func finishYieldsRemainingInBatches() async {
+      let batcher = Batcher<Int>(maxBatchSize: 3)
+
+      await withDiscardingTaskGroup { g in
+        g.addTask {
+          batcher.send(contentsOf: [1, 2, 3, 4, 5, 6, 7])
+          batcher.finish()
+        }
+
+        let batches = await Array(batcher)
+        #expect(batches == [[1, 2, 3], [4, 5, 6], [7]])
+      }
+    }
+
+    @available(AsyncAlgorithms 1.2, *)
+    @Test func allValuesReceived() async {
+      let batcher = Batcher<Int>(maxBatchSize: 2)
+
+      await withDiscardingTaskGroup { g in
+        g.addTask {
+          batcher.send(contentsOf: [1, 2, 3, 4, 5])
+          batcher.finish()
+        }
+
+        let allValues = await Array(batcher).flatMap(\.self)
+        #expect(allValues == [1, 2, 3, 4, 5])
+      }
+    }
+
+    @available(AsyncAlgorithms 1.2, *)
+    @Test func nilMaxBatchSizeReturnsAll() async {
+      let batcher = Batcher(initialValues: [1, 2, 3, 4, 5], maxBatchSize: nil)
+      batcher.finish()
+
+      let batches = await Array(batcher)
+      #expect(batches == [[1, 2, 3, 4, 5]])
+    }
+  }
+
   @Suite("Concurrency")
   struct Concurrency {
     @available(AsyncAlgorithms 1.2, *)

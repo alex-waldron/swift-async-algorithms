@@ -1,3 +1,4 @@
+import DequeModule
 import OSLog
 import SwiftUI
 import Synchronization
@@ -18,10 +19,17 @@ private let logger = Logger(subsystem: "swift-async-algorithms", category: "Batc
 public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
 
   private let state: CriticalState<State>
+  private let maxBatchSize: Int?
 
-  /// Creates a batcher with optional initial values in the buffer.
-  public init(initialValues: [Value] = []) {
-    self.state = CriticalState(initialValue: .bufferringValues(initialValues))
+  /// Creates a batcher with optional initial values in the buffer and an optional max batch size.
+  ///
+  /// - Parameters:
+  ///   - initialValues: Values to pre-populate the buffer with.
+  ///   - maxBatchSize: The maximum number of elements to yield per iteration.
+  ///     If `nil`, all buffered values are yielded at once.
+  public init(initialValues: [Value] = [], maxBatchSize: Int? = nil) {
+    self.state = CriticalState(initialValue: .bufferringValues(Deque(initialValues)))
+    self.maxBatchSize = maxBatchSize
   }
 
   /// Adds a value to the buffer. Never blocks.
@@ -50,37 +58,38 @@ public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
   /// 2. We dont have anything to return immediately which means we have a continuation. When we get values, the continuation gets resumed and we get the buffer going
   /// 3. ? we are terminated
   enum State {
-    case bufferringValues([Value])
+    case bufferringValues(Deque<Value>)
     case waitingForMoreValues(CheckedContinuation<Void, Never>)
     /// remaining values is for when we transfer from buffering to terminated but want to yield what we have up to this point
-    case terminated(remainingValues: [Value])
+    case terminated(remainingValues: Deque<Value>)
 
-    /// Consumes the buffer. Invalid to call when we are waiting for values
-    mutating func consumeBuffer() -> [Value]? {
+    /// Consumes the buffer. Invalid to call when we are waiting for values.
+    /// - Parameter maxSize: The maximum number of elements to consume. If `nil`, consumes all.
+    mutating func consumeBuffer(maxSize: Int?) -> [Value]? {
       switch self {
-      case .bufferringValues(let values):
+      case .bufferringValues(var buffer):
         if Task.isCancelled {
           logger.debug(
             "ConsumeBuffer: Task is cancelled. Clearing buffer and setting state to terminated"
           )
-          self = .terminated(remainingValues: [])
+          self = .terminated(remainingValues: Deque())
           return nil
-        } else {
-          logger.debug("ConsumeBuffer: Consuming buffer")
-          self = .bufferringValues([])
-          return values
         }
-      case .terminated(let remainingValues):
+        logger.debug("ConsumeBuffer: Consuming buffer \(Array(buffer))")
+        let values = buffer.consume(maxSize: maxSize)
+        self = .bufferringValues(buffer)
+        return values
+      case .terminated(var remainingValues):
         // if we are terminated but we still have values in our buffer, yield and consume them
         // the next iteration will finish the sequence
-        if !remainingValues.isEmpty {
-          logger.debug("ConsumeBuffer: Yielding remaining values")
-          self = .terminated(remainingValues: [])
-          return remainingValues
-        } else {
+        guard !remainingValues.isEmpty else {
           logger.debug("ConsumeBuffer: Sequence terminated")
           return nil
         }
+        logger.debug("ConsumeBuffer: Yielding remaining values")
+        let values = remainingValues.consume(maxSize: maxSize)
+        self = .terminated(remainingValues: remainingValues)
+        return values
       case .waitingForMoreValues:
         // the iterator is either being consumed across actor contexts or we screwed something up
         fatalError(
@@ -94,16 +103,16 @@ public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
       // 2. We have downstream demand, add new values to buffer and resume the continuation
       // 3. We are terminated, this is a no-op
       switch self {
-      case .bufferringValues(var bufferedValues):
+      case .bufferringValues(var buffer):
         logger.debug("No downstream demand, adding to buffer")
-        bufferedValues.append(contentsOf: values)
-        self = .bufferringValues(bufferedValues)
+        buffer.append(contentsOf: values)
+        self = .bufferringValues(buffer)
       case .waitingForMoreValues(let continuation):
         logger.debug(
           "Have downstream demand, resuming continuation and transitioning to buffering values"
         )
         continuation.resume()
-        self = .bufferringValues(Array(values))
+        self = .bufferringValues(Deque(values))
       case .terminated:
         logger.debug("Values received but we're terminated, ignoring")
       }
@@ -113,14 +122,14 @@ public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
       // if we are buffering, stop accepting new values, yield whatever we got the next chance we get.
       // if we are waiting for more values, resume the continuation, transition to terminated without emitting anymore vals
       switch self {
-      case .bufferringValues(let bufferedValues):
+      case .bufferringValues(let buffer):
         logger.debug(
-          "Received finish, transitioning from buffering to terminated. Moving vals \(bufferedValues) over"
+          "Received finish, transitioning from buffering to terminated. Moving vals \(Array(buffer)) over"
         )
-        self = .terminated(remainingValues: bufferedValues)
+        self = .terminated(remainingValues: buffer)
       case .waitingForMoreValues(let continuation):
         logger.debug("Transitioning from waiting for more to terminated")
-        self = .terminated(remainingValues: [])
+        self = .terminated(remainingValues: Deque())
         continuation.resume()
       case .terminated:
         logger.debug("Received finish but were already terminated. Ignoring")
@@ -133,12 +142,12 @@ public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
         logger.debug(
           "Iterator: Task was cancelled. Return immediately and set state")
         continuation.resume()
-        self = .terminated(remainingValues: [])
+        self = .terminated(remainingValues: Deque())
         return
       }
       switch self {
-      case .bufferringValues(let bufferedValues):
-        if bufferedValues.isEmpty {
+      case .bufferringValues(let buffer):
+        if buffer.isEmpty {
           // we didnt receive any new values between the consumption of values and now. actually suspend
           logger.debug(
             "Iterator: Setting continuation and awaiting new values")
@@ -147,7 +156,7 @@ public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
           // we received new values while waiting to suspend.
           // resume the continuation immediately and don't touch the state
           logger.debug(
-            "Iterator: Received values \(bufferedValues) while waiting to suspend. Continue immediately"
+            "Iterator: Received values \(Array(buffer)) while waiting to suspend. Continue immediately"
           )
           continuation.resume()
         }
@@ -169,7 +178,7 @@ public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
           "Received cancellation while waiting for more values. Resuming and transitioning to terminated"
         )
         continuation.resume()
-        self = .terminated(remainingValues: [])
+        self = .terminated(remainingValues: Deque())
       }
     }
   }
@@ -179,13 +188,15 @@ public struct Batcher<Value: Sendable>: AsyncSequence, Sendable {
 extension Batcher {
   public struct Iterator: AsyncIteratorProtocol {
     fileprivate let state: CriticalState<State>
+    fileprivate let maxBatchSize: Int?
 
-    fileprivate init(state: CriticalState<State>) {
+    fileprivate init(state: CriticalState<State>, maxBatchSize: Int?) {
       self.state = state
+      self.maxBatchSize = maxBatchSize
     }
 
     public func next(isolation iterationIsolation: isolated (any Actor)?) async -> [Value]? {
-      let values = state.withLock { $0.consumeBuffer() }
+      let values = state.withLock { $0.consumeBuffer(maxSize: maxBatchSize) }
 
       guard let values else {
         return nil
@@ -214,7 +225,7 @@ extension Batcher {
 
         // grab the values after suspension resumes
         // This is what allows for transactionality
-        return state.withLock { $0.consumeBuffer() }
+        return state.withLock { $0.consumeBuffer(maxSize: maxBatchSize) }
       } else {
         logger.debug("Iterator: Values in buffer. Returning immediately")
         return values
@@ -224,7 +235,21 @@ extension Batcher {
   }
 
   public func makeAsyncIterator() -> Iterator {
-    Iterator(state: state)
+    Iterator(state: state, maxBatchSize: maxBatchSize)
+  }
+}
+
+extension Deque {
+  /// Removes and returns up to `maxSize` elements from the front, or all elements if `maxSize` is nil.
+  mutating func consume(maxSize: Int?) -> [Element] {
+    if let maxSize, maxSize < count {
+      let batch = Array(prefix(maxSize))
+      removeFirst(maxSize)
+      return batch
+    } else {
+      defer { removeAll() }
+      return Array(self)
+    }
   }
 }
 
